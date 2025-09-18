@@ -1,0 +1,24 @@
+{
+  "name": "sf-coverage-viewer",
+  "version": "1.0.0",
+  "description": "Section 508 compliant Salesforce code coverage viewer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "keywords": [
+    "salesforce",
+    "code-coverage",
+    "accessibility",
+    "section-508",
+    "wcag"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {}
+}
