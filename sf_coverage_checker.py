@@ -17,6 +17,189 @@ import time
 import concurrent.futures
 import threading
 from multiprocessing import cpu_count
+import os
+import platform
+import shutil
+
+class SFCLIDetector:
+    """Smart SF CLI detection for cross-platform environments"""
+    
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.sf_path = None
+        self.is_windows = platform.system().lower() == 'windows'
+        self.is_wsl = self._is_wsl()
+    
+    def _is_wsl(self) -> bool:
+        """Detect if running in WSL"""
+        try:
+            with open('/proc/version', 'r') as f:
+                return 'microsoft' in f.read().lower()
+        except:
+            return False
+    
+    def _log(self, message: str):
+        """Internal logging"""
+        if self.verbose:
+            print(f"[SF-DETECT] {message}")
+    
+    def detect_sf_cli(self) -> Optional[str]:
+        """Detect SF CLI installation across different environments"""
+        self._log(f"Detecting SF CLI on {platform.system()} (WSL: {self.is_wsl})")
+        
+        # Try common command variations first
+        simple_commands = ['sf', 'sfdx']
+        for cmd in simple_commands:
+            if self._test_command(cmd):
+                self.sf_path = cmd
+                self._log(f"Found SF CLI using simple command: {cmd}")
+                return cmd
+        
+        # Try npx variations
+        npx_commands = ['npx sf', 'npx @salesforce/cli', 'npx sfdx']
+        for cmd in npx_commands:
+            if self._test_command(cmd.split()):
+                self.sf_path = cmd.split()
+                self._log(f"Found SF CLI using npx: {cmd}")
+                return cmd.split()
+        
+        # Search in common installation paths
+        search_paths = self._get_search_paths()
+        for path in search_paths:
+            sf_executable = self._find_sf_in_path(path)
+            if sf_executable and self._test_command([sf_executable]):
+                self.sf_path = sf_executable
+                self._log(f"Found SF CLI at: {sf_executable}")
+                return sf_executable
+        
+        # Last resort: use 'which' or 'where' command
+        location_cmd = 'where' if self.is_windows else 'which'
+        for sf_name in ['sf', 'sf.exe', 'sf.cmd']:
+            try:
+                result = subprocess.run([location_cmd, sf_name], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0 and result.stdout.strip():
+                    found_path = result.stdout.strip().split('\n')[0]
+                    if self._test_command([found_path]):
+                        self.sf_path = found_path
+                        self._log(f"Found SF CLI using {location_cmd}: {found_path}")
+                        return found_path
+            except:
+                continue
+        
+        self._log("SF CLI not found in any common locations")
+        return None
+    
+    def _get_search_paths(self) -> List[str]:
+        """Get platform-specific search paths"""
+        paths = []
+        
+        if self.is_windows:
+            # Windows paths
+            program_files = [
+                os.environ.get('PROGRAMFILES', 'C:\\Program Files'),
+                os.environ.get('PROGRAMFILES(X86)', 'C:\\Program Files (x86)'),
+                os.environ.get('LOCALAPPDATA', ''),
+                os.environ.get('APPDATA', '')
+            ]
+            
+            for pf in program_files:
+                if pf:
+                    paths.extend([
+                        os.path.join(pf, 'Salesforce CLI'),
+                        os.path.join(pf, 'sfdx'),
+                        os.path.join(pf, 'sf'),
+                        os.path.join(pf, 'nodejs'),
+                        os.path.join(pf, 'npm', 'node_modules', '.bin'),
+                        os.path.join(pf, 'npm', 'node_modules', '@salesforce', 'cli', 'bin')
+                    ])
+            
+            # User-specific paths
+            userprofile = os.environ.get('USERPROFILE', '')
+            if userprofile:
+                paths.extend([
+                    os.path.join(userprofile, 'AppData', 'Roaming', 'npm'),
+                    os.path.join(userprofile, 'AppData', 'Roaming', 'npm', 'node_modules', '.bin'),
+                    os.path.join(userprofile, '.npm-global', 'bin'),
+                    os.path.join(userprofile, 'scoop', 'apps', 'salesforce-cli'),
+                    os.path.join(userprofile, 'scoop', 'shims')
+                ])
+        
+        else:
+            # Unix-like paths (Linux, macOS, WSL)
+            home = os.path.expanduser('~')
+            paths.extend([
+                '/usr/local/bin',
+                '/usr/bin',
+                '/bin',
+                '/opt/sf/bin',
+                '/opt/salesforce/bin',
+                os.path.join(home, '.local', 'bin'),
+                os.path.join(home, '.npm-global', 'bin'),
+                os.path.join(home, 'node_modules', '.bin'),
+                '/usr/local/lib/node_modules/.bin',
+                '/usr/lib/node_modules/.bin'
+            ])
+            
+            # Check if we can access npm global dir
+            try:
+                result = subprocess.run(['npm', 'bin', '-g'], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    npm_bin = result.stdout.strip()
+                    if npm_bin:
+                        paths.append(npm_bin)
+            except:
+                pass
+        
+        # Remove duplicates and non-existent paths
+        unique_paths = []
+        for path in paths:
+            if path and os.path.exists(path) and path not in unique_paths:
+                unique_paths.append(path)
+        
+        return unique_paths
+    
+    def _find_sf_in_path(self, search_path: str) -> Optional[str]:
+        """Find SF CLI executable in a specific path"""
+        if not os.path.exists(search_path):
+            return None
+        
+        sf_names = ['sf', 'sf.exe', 'sf.cmd', 'sf.bat'] if self.is_windows else ['sf', 'sfdx']
+        
+        for sf_name in sf_names:
+            sf_full_path = os.path.join(search_path, sf_name)
+            if os.path.isfile(sf_full_path):
+                return sf_full_path
+        
+        return None
+    
+    def _test_command(self, cmd) -> bool:
+        """Test if a command works"""
+        try:
+            # Ensure cmd is a list
+            if isinstance(cmd, str):
+                cmd = [cmd]
+            
+            # Test with --version flag
+            test_cmd = cmd + ['--version']
+            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
+            return result.returncode == 0 and 'salesforce' in result.stdout.lower()
+        except:
+            return False
+    
+    def get_sf_command(self) -> List[str]:
+        """Get the SF CLI command as a list for subprocess"""
+        if self.sf_path is None:
+            self.detect_sf_cli()
+        
+        if self.sf_path is None:
+            return None
+        
+        if isinstance(self.sf_path, list):
+            return self.sf_path
+        else:
+            return [self.sf_path]
 
 class SalesforceCodeCoverage:
     def __init__(self, org_alias: str, verbose: bool = False, max_workers: int = None):
@@ -27,6 +210,29 @@ class SalesforceCodeCoverage:
         self.test_results = {}
         self.org_info = {}
         self._lock = threading.Lock()
+        
+        # Initialize SF CLI detector
+        self.sf_detector = SFCLIDetector(verbose)
+        self.sf_command = None
+        
+    def _ensure_sf_cli(self) -> bool:
+        """Ensure SF CLI is available and detected"""
+        if self.sf_command is None:
+            self.log("Detecting SF CLI installation...")
+            self.sf_command = self.sf_detector.get_sf_command()
+            
+            if self.sf_command is None:
+                self.log("SF CLI not found. Please install SF CLI:", "ERROR")
+                self.log("  Option 1: Download from https://developer.salesforce.com/tools/salesforcecli", "ERROR")
+                self.log("  Option 2: Install via npm: npm install -g @salesforce/cli", "ERROR")
+                self.log("  Option 3: Use package manager (choco, brew, apt, etc.)", "ERROR")
+                return False
+            
+            # Test the detected command
+            cmd_str = ' '.join(self.sf_command) if isinstance(self.sf_command, list) else self.sf_command
+            self.log(f"Using SF CLI: {cmd_str}")
+            
+        return True
         
     def log(self, message: str, level: str = "INFO"):
         """Thread-safe logging with timestamp"""
