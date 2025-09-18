@@ -73,8 +73,14 @@ class SFCLIDetector:
                 return sf_executable
         
         # Last resort: use 'which' or 'where' command
-        location_cmd = 'where' if self.is_windows else 'which'
-        for sf_name in ['sf', 'sf.exe', 'sf.cmd']:
+        location_cmd = 'where' if (self.is_windows and not self.is_wsl) else 'which'
+        search_names = ['sf', 'sfdx']
+        
+        # Add Windows extensions when in PowerShell
+        if self.is_windows and not self.is_wsl:
+            search_names.extend(['sf.exe', 'sf.cmd', 'sf.bat', 'sfdx.exe', 'sfdx.cmd', 'sfdx.bat'])
+        
+        for sf_name in search_names:
             try:
                 result = subprocess.run([location_cmd, sf_name], 
                                       capture_output=True, text=True, timeout=10)
@@ -141,16 +147,27 @@ class SFCLIDetector:
                 '/usr/lib/node_modules/.bin'
             ])
             
-            # Check if we can access npm global dir
+            # Check npm config prefix (corporate-friendly approach)
             try:
-                result = subprocess.run(['npm', 'bin', '-g'], 
-                                      capture_output=True, text=True, timeout=10)
-                if result.returncode == 0:
-                    npm_bin = result.stdout.strip()
-                    if npm_bin:
-                        paths.append(npm_bin)
-            except:
+                result = subprocess.run(['npm', 'config', 'get', 'prefix'], 
+                                      capture_output=True, text=True, timeout=15)
+                if result.returncode == 0 and result.stdout.strip():
+                    npm_prefix = result.stdout.strip()
+                    self._log(f"NPM prefix: {npm_prefix}")
+                    # Add common paths under the prefix
+                    prefix_paths = [
+                        npm_prefix,
+                        os.path.join(npm_prefix, 'bin'),
+                        os.path.join(npm_prefix, 'node_modules', '.bin'),
+                        os.path.join(npm_prefix, 'lib', 'node_modules', '.bin')
+                    ]
+                    paths.extend(prefix_paths)
+            except Exception as e:
+                self._log(f"Could not get npm prefix: {e}")
                 pass
+        
+        # Try to get npm prefix for corporate environments
+        self._add_npm_prefix_paths(paths)
         
         # Remove duplicates and non-existent paths
         unique_paths = []
@@ -158,21 +175,92 @@ class SFCLIDetector:
             if path and os.path.exists(path) and path not in unique_paths:
                 unique_paths.append(path)
         
+        self._log(f"Searching in {len(unique_paths)} potential paths")
+        if self.verbose:
+            for i, path in enumerate(unique_paths[:10]):  # Show first 10 paths
+                self._log(f"  {i+1}. {path}")
+            if len(unique_paths) > 10:
+                self._log(f"  ... and {len(unique_paths) - 10} more paths")
+        
         return unique_paths
+    
+    def _add_npm_prefix_paths(self, paths: List[str]):
+        """Add paths based on npm config prefix only (corporate-friendly)"""
+        self._log("Checking npm prefix for SF CLI installation...")
+        
+        try:
+            # Only use npm config get prefix - safe for corporate environments
+            result = subprocess.run(['npm', 'config', 'get', 'prefix'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                npm_prefix = result.stdout.strip()
+                self._log(f"Found npm prefix: {npm_prefix}")
+                
+                # Build potential SF CLI paths from the prefix
+                prefix_paths = [
+                    # Direct bin directory
+                    os.path.join(npm_prefix, 'bin'),
+                    
+                    # Node modules bin directories  
+                    os.path.join(npm_prefix, 'node_modules', '.bin'),
+                    os.path.join(npm_prefix, 'lib', 'node_modules', '.bin'),
+                    
+                    # Specific SF CLI installation paths
+                    os.path.join(npm_prefix, 'node_modules', '@salesforce', 'cli', 'bin'),
+                    os.path.join(npm_prefix, 'lib', 'node_modules', '@salesforce', 'cli', 'bin'),
+                    os.path.join(npm_prefix, 'node_modules', 'sfdx', 'bin'),
+                    os.path.join(npm_prefix, 'lib', 'node_modules', 'sfdx', 'bin'),
+                    
+                    # The prefix itself
+                    npm_prefix
+                ]
+                
+                self._log(f"Adding {len(prefix_paths)} npm-prefix-based paths")
+                paths.extend(prefix_paths)
+                
+        except Exception as e:
+            self._log(f"Could not get npm prefix: {e}")
+            pass
     
     def _find_sf_in_path(self, search_path: str) -> Optional[str]:
         """Find SF CLI executable in a specific path"""
         if not os.path.exists(search_path):
             return None
         
-        sf_names = ['sf', 'sf.exe', 'sf.cmd', 'sf.bat'] if self.is_windows else ['sf', 'sfdx']
+        # Different executable names for different environments
+        if self.is_windows and not self.is_wsl:
+            # PowerShell/Windows: need .exe, .cmd, .bat extensions
+            sf_names = ['sf.exe', 'sf.cmd', 'sf.bat', 'sf', 'sfdx.exe', 'sfdx.cmd', 'sfdx.bat', 'sfdx']
+        else:
+            # WSL/Linux/macOS: no extensions needed
+            sf_names = ['sf', 'sfdx']
+        
+        self._log(f"Searching for {sf_names} in {search_path}")
         
         for sf_name in sf_names:
             sf_full_path = os.path.join(search_path, sf_name)
             if os.path.isfile(sf_full_path):
-                return sf_full_path
+                # Additional check: ensure it's executable
+                if self._is_executable(sf_full_path):
+                    self._log(f"Found executable SF CLI: {sf_full_path}")
+                    return sf_full_path
+                else:
+                    self._log(f"Found {sf_full_path} but it's not executable")
         
         return None
+    
+    def _is_executable(self, file_path: str) -> bool:
+        """Check if a file is executable"""
+        if not os.path.isfile(file_path):
+            return False
+        
+        if self.is_windows and not self.is_wsl:
+            # On Windows, check file extension
+            _, ext = os.path.splitext(file_path.lower())
+            return ext in ['.exe', '.cmd', '.bat', '.com'] or os.access(file_path, os.X_OK)
+        else:
+            # On Unix-like systems (including WSL), check execute permission
+            return os.access(file_path, os.X_OK)
     
     def _test_command(self, cmd) -> bool:
         """Test if a command works"""
@@ -184,8 +272,16 @@ class SFCLIDetector:
             # Test with --version flag
             test_cmd = cmd + ['--version']
             result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
-            return result.returncode == 0 and 'salesforce' in result.stdout.lower()
-        except:
+            
+            success = result.returncode == 0 and 'salesforce' in result.stdout.lower()
+            if success:
+                self._log(f"Successfully tested command: {' '.join(cmd)}")
+            else:
+                self._log(f"Command test failed for: {' '.join(cmd)} (returncode: {result.returncode})")
+                
+            return success
+        except Exception as e:
+            self._log(f"Exception testing command {cmd}: {e}")
             return False
     
     def get_sf_command(self) -> List[str]:
@@ -241,9 +337,15 @@ class SalesforceCodeCoverage:
             with self._lock:
                 print(f"[{timestamp}] {level}: {message}")
     
-    def run_sf_command(self, command: List[str]) -> Tuple[bool, str, str]:
+    def run_sf_command(self, sf_args: List[str]) -> Tuple[bool, str, str]:
         """Execute SF CLI command and return success status, stdout, stderr"""
+        if not self._ensure_sf_cli():
+            return False, "", "SF CLI not available"
+        
         try:
+            # Build complete command
+            command = self.sf_command + sf_args
+            
             self.log(f"Running: {' '.join(command)}")
             result = subprocess.run(
                 command, 
@@ -268,20 +370,20 @@ class SalesforceCodeCoverage:
         self.log("Verifying SF CLI installation and org authentication...")
         
         # Check SF CLI installation
-        success, stdout, stderr = self.run_sf_command(["sf", "--version"])
+        success, stdout, stderr = self.run_sf_command(["--version"])
         if not success:
-            self.log("SF CLI not found. Please install SF CLI.", "ERROR")
             return False
         
         self.log(f"SF CLI version: {stdout.strip()}")
         
         # Check org authentication and get org details
         success, stdout, stderr = self.run_sf_command([
-            "sf", "org", "display", "--target-org", self.org_alias, "--json"
+            "org", "display", "--target-org", self.org_alias, "--json"
         ])
         
         if not success:
             self.log(f"Failed to connect to org '{self.org_alias}'. Please check authentication.", "ERROR")
+            self.log(f"Try: {' '.join(self.sf_command)} org login web --alias {self.org_alias}", "ERROR")
             return False
         
         try:
@@ -307,7 +409,7 @@ class SalesforceCodeCoverage:
         
         query = "SELECT Id, Name FROM ApexClass WHERE NamespacePrefix = null ORDER BY Name"
         success, stdout, stderr = self.run_sf_command([
-            "sf", "data", "query", "--query", query, 
+            "data", "query", "--query", query, 
             "--target-org", self.org_alias, "--json"
         ])
         
@@ -330,7 +432,7 @@ class SalesforceCodeCoverage:
         
         query = "SELECT Id, Name FROM ApexTrigger WHERE NamespacePrefix = null ORDER BY Name"
         success, stdout, stderr = self.run_sf_command([
-            "sf", "data", "query", "--query", query, 
+            "data", "query", "--query", query, 
             "--target-org", self.org_alias, "--json"
         ])
         
@@ -352,7 +454,7 @@ class SalesforceCodeCoverage:
         self.log("Running all tests in the organization...")
         
         success, stdout, stderr = self.run_sf_command([
-            "sf", "apex", "run", "test", "--test-level", "RunLocalTests",
+            "apex", "run", "test", "--test-level", "RunLocalTests",
             "--target-org", self.org_alias, "--wait", "30", "--json"
         ])
         
@@ -417,7 +519,7 @@ class SalesforceCodeCoverage:
         def execute_query(query_info):
             query_type, query = query_info
             success, stdout, stderr = self.run_sf_command([
-                "sf", "data", "query", "--query", query,
+                "data", "query", "--query", query,
                 "--target-org", self.org_alias, "--json"
             ])
             
