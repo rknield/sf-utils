@@ -4,7 +4,19 @@ Simple Working Salesforce Code Coverage Checker
 Requires Python 3.13.1 and SF CLI (not sfdx)
 
 Usage: python sf_coverage_checker.py --org <org_alias> [options]
+
+Configuration:
+- Modify SALESFORCE_API_VERSION below to change API version
+- Default is 65.0 (Winter '26)
 """
+
+# =============================================================================
+# CONFIGURATION - Update these values as needed
+# =============================================================================
+SALESFORCE_API_VERSION = "65.0"  # Change this to use different API version
+# Available versions: 65.0, 64.0, 63.0, 62.0, etc.
+# See: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_versions.htm
+# =============================================================================
 
 import argparse
 import json
@@ -365,9 +377,34 @@ class SalesforceCodeCoverage:
             self.log(f"Command execution failed: {str(e)}", "ERROR")
             return False, "", str(e)
     
+    def run_sf_query(self, query: str, use_tooling_api: bool = False) -> Tuple[bool, str, str]:
+        """Execute SF CLI query with proper API version and tooling API support"""
+        # Clean up the query - remove extra whitespace and newlines
+        clean_query = ' '.join(query.strip().split())
+        
+        # Build command with API version
+        if use_tooling_api:
+            cmd_args = [
+                "data", "query", "--query", clean_query,
+                "--target-org", self.org_alias, 
+                "--use-tooling-api",
+                "--api-version", SALESFORCE_API_VERSION,
+                "--json"
+            ]
+        else:
+            cmd_args = [
+                "data", "query", "--query", clean_query,
+                "--target-org", self.org_alias,
+                "--api-version", SALESFORCE_API_VERSION, 
+                "--json"
+            ]
+        
+        return self.run_sf_command(cmd_args)
+    
     def verify_org_connection(self) -> bool:
         """Verify SF CLI is installed and org is authenticated"""
         self.log("Verifying SF CLI installation and org authentication...")
+        self.log(f"Using Salesforce API version: {SALESFORCE_API_VERSION}")
         
         # Check SF CLI installation
         success, stdout, stderr = self.run_sf_command(["--version"])
@@ -394,7 +431,8 @@ class SalesforceCodeCoverage:
                 "org_name": result.get("alias", result.get("username", "Unknown")),
                 "org_url": result.get("instanceUrl", "Unknown"),
                 "username": result.get("username", "Unknown"),
-                "org_id": result.get("id", "Unknown")
+                "org_id": result.get("id", "Unknown"),
+                "api_version": SALESFORCE_API_VERSION
             }
             
             self.log(f"Connected to org: {self.org_info['username']}")
@@ -408,13 +446,12 @@ class SalesforceCodeCoverage:
         self.log("Retrieving Apex classes...")
         
         query = "SELECT Id, Name FROM ApexClass WHERE NamespacePrefix = null ORDER BY Name"
-        success, stdout, stderr = self.run_sf_command([
-            "data", "query", "--query", query, 
-            "--target-org", self.org_alias, "--json"
-        ])
+        success, stdout, stderr = self.run_sf_query(query, use_tooling_api=False)
         
         if not success:
             self.log(f"Failed to query Apex classes: {stderr}", "ERROR")
+            if "unexpected token" in stderr.lower():
+                self.log(f"Query syntax error. Query was: {query}", "ERROR")
             return []
         
         try:
@@ -431,13 +468,12 @@ class SalesforceCodeCoverage:
         self.log("Retrieving Apex triggers...")
         
         query = "SELECT Id, Name FROM ApexTrigger WHERE NamespacePrefix = null ORDER BY Name"
-        success, stdout, stderr = self.run_sf_command([
-            "data", "query", "--query", query, 
-            "--target-org", self.org_alias, "--json"
-        ])
+        success, stdout, stderr = self.run_sf_query(query, use_tooling_api=False)
         
         if not success:
             self.log(f"Failed to query Apex triggers: {stderr}", "ERROR")
+            if "unexpected token" in stderr.lower():
+                self.log(f"Query syntax error. Query was: {query}", "ERROR")
             return []
         
         try:
@@ -491,9 +527,10 @@ class SalesforceCodeCoverage:
         """Get coverage data using parallel queries"""
         self.log("Retrieving coverage data...")
         
+        # Updated queries for API 65.0 with correct field names
         queries = {
             "aggregate": """
-                SELECT ApexClassOrTrigger.Name, ApexClassOrTrigger.Id, 
+                SELECT ApexClassOrTriggerId, ApexClassOrTrigger.Name, 
                        NumLinesCovered, NumLinesUncovered
                 FROM ApexCodeCoverageAggregate 
                 WHERE ApexClassOrTrigger.NamespacePrefix = null
@@ -518,13 +555,18 @@ class SalesforceCodeCoverage:
         
         def execute_query(query_info):
             query_type, query = query_info
-            success, stdout, stderr = self.run_sf_command([
-                "data", "query", "--query", query,
-                "--target-org", self.org_alias, "--json"
-            ])
+            
+            # Determine if this query needs Tooling API
+            use_tooling = query_type in ["aggregate", "test_results", "test_coverage"]
+            
+            self.log(f"Executing {query_type} query using {'Tooling API' if use_tooling else 'Standard API'}...")
+            
+            success, stdout, stderr = self.run_sf_query(query, use_tooling_api=use_tooling)
             
             if not success:
                 self.log(f"Failed to execute {query_type} query: {stderr}", "WARNING")
+                if "unexpected token" in stderr.lower():
+                    self.log(f"Query syntax error in {query_type}. Query was: {' '.join(query.split())}", "ERROR")
                 return query_type, []
             
             try:
@@ -548,20 +590,23 @@ class SalesforceCodeCoverage:
         return results
     
     def process_coverage_data(self, aggregate_records: List[Dict]) -> Dict:
-        """Process aggregate coverage data"""
+        """Process aggregate coverage data with API 65.0 field names"""
         if not aggregate_records:
             return {}
         
         coverage_data = {}
         for record in aggregate_records:
+            # Use correct field name for API 65.0: ApexClassOrTriggerId instead of ApexClassOrTrigger.Id
             name = record.get("ApexClassOrTrigger", {}).get("Name")
+            apex_id = record.get("ApexClassOrTriggerId")
+            
             if name:
                 covered = record.get("NumLinesCovered", 0) or 0
                 uncovered = record.get("NumLinesUncovered", 0) or 0
                 total = covered + uncovered
                 
                 coverage_data[name] = {
-                    "id": record.get("ApexClassOrTrigger", {}).get("Id"),
+                    "id": apex_id,
                     "covered_lines": covered,
                     "uncovered_lines": uncovered,
                     "total_lines": total,
